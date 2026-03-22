@@ -2,6 +2,10 @@
 
 A small Axum web server that mimics Nginx-style request logging with a runtime-togglable log level.
 
+## Demo
+
+![nginx-logger demo](demo.gif)
+
 ## Features
 
 - **Web form** — `GET /` serves an HTML form to submit a name and age
