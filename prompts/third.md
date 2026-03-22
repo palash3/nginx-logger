@@ -1,0 +1,1 @@
+Add tests for signal as well.
