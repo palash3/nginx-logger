@@ -13,4 +13,5 @@ tracing-subscriber = { version = "0.3.23", features = ["registry"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"
+libc = "0.2.183"
 tower = { version = "0.5.3", features = ["util"] }

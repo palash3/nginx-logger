@@ -144,6 +144,19 @@ async fn log_request(request: axum::extract::Request, next: Next) -> axum::respo
 }
 
 // ---------------------------------------------------------------------------
+// Signal helpers
+// ---------------------------------------------------------------------------
+
+/// Pure toggle: DEBUG → INFO → DEBUG → …
+fn toggle_level(current: Level) -> Level {
+    if current == Level::DEBUG {
+        Level::INFO
+    } else {
+        Level::DEBUG
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -170,11 +183,7 @@ async fn main() -> Result<(), AppError> {
         let mut current = Level::DEBUG;
         loop {
             sig_stream.recv().await;
-            current = if current == Level::DEBUG {
-                Level::INFO
-            } else {
-                Level::DEBUG
-            };
+            current = toggle_level(current);
             if let Err(e) = reload_handle.modify(|f| *f = LevelFilter::from_level(current)) {
                 error!(error = %AppError::LevelReload(e), "failed to update log level");
             } else {
@@ -209,6 +218,8 @@ mod tests {
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    #[cfg(unix)]
+    use libc;
     use tower::ServiceExt; // for `.oneshot()`
 
     fn test_app() -> Router {
@@ -316,5 +327,85 @@ mod tests {
 
         // axum returns 422 Unprocessable Entity when form fields are missing.
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal / log-level tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_level_debug_becomes_info() {
+        assert_eq!(toggle_level(Level::DEBUG), Level::INFO);
+    }
+
+    #[test]
+    fn toggle_level_info_becomes_debug() {
+        assert_eq!(toggle_level(Level::INFO), Level::DEBUG);
+    }
+
+    #[test]
+    fn toggle_level_cycles_back() {
+        let l = Level::DEBUG;
+        let l = toggle_level(l);
+        let l = toggle_level(l);
+        assert_eq!(l, Level::DEBUG, "two toggles should return to DEBUG");
+    }
+
+    #[tokio::test]
+    async fn reload_handle_updates_level_filter() {
+        // `_layer` must stay alive: the handle holds a Weak reference to it.
+        let (_layer, handle) =
+            reload::Layer::<LevelFilter, tracing_subscriber::Registry>::new(LevelFilter::DEBUG);
+
+        handle
+            .modify(|f| *f = LevelFilter::INFO)
+            .expect("modify should succeed");
+
+        handle
+            .with_current(|f| assert_eq!(*f, LevelFilter::INFO))
+            .expect("with_current should succeed");
+    }
+
+    /// End-to-end: send SIGUSR1 to the current process and verify the reload
+    /// handle reflects the toggled level.
+    #[tokio::test]
+    async fn sigusr1_toggles_reload_handle_level() {
+        // `_layer` must stay alive: the handle holds a Weak reference to it.
+        let (_layer, handle) =
+            reload::Layer::<LevelFilter, tracing_subscriber::Registry>::new(LevelFilter::DEBUG);
+        let handle_task = handle.clone();
+
+        // Shared level so the test can inspect what the task recorded.
+        let level_seen: Arc<Mutex<Option<Level>>> = Arc::new(Mutex::new(None));
+        let level_seen_task = Arc::clone(&level_seen);
+
+        let mut sig =
+            signal(SignalKind::user_defined1()).expect("failed to register SIGUSR1 in test");
+
+        tokio::spawn(async move {
+            sig.recv().await;
+            let new_level = toggle_level(Level::DEBUG);
+            *level_seen_task.lock().unwrap() = Some(new_level);
+            handle_task
+                .modify(|f| *f = LevelFilter::from_level(new_level))
+                .unwrap();
+        });
+
+        // Send SIGUSR1 to ourselves.
+        unsafe { libc::raise(libc::SIGUSR1) };
+
+        // Give the spawned task a moment to process the signal.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // The task should have toggled DEBUG → INFO.
+        assert_eq!(
+            *level_seen.lock().unwrap(),
+            Some(Level::INFO),
+            "task should have recorded INFO after first SIGUSR1"
+        );
+
+        handle
+            .with_current(|f| assert_eq!(*f, LevelFilter::INFO))
+            .expect("reload handle should reflect INFO");
     }
 }
