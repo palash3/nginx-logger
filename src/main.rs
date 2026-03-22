@@ -156,6 +156,19 @@ fn toggle_level(current: Level) -> Level {
     }
 }
 
+/// Toggle `current` to the next level, write it into `handle`, and return the
+/// new level.  This is the unit of work performed on every SIGUSR1.
+fn apply_toggle(
+    handle: &reload::Handle<LevelFilter, tracing_subscriber::Registry>,
+    current: Level,
+) -> Result<Level, AppError> {
+    let new_level = toggle_level(current);
+    handle
+        .modify(|f| *f = LevelFilter::from_level(new_level))
+        .map_err(AppError::LevelReload)?;
+    Ok(new_level)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -183,11 +196,12 @@ async fn main() -> Result<(), AppError> {
         let mut current = Level::DEBUG;
         loop {
             sig_stream.recv().await;
-            current = toggle_level(current);
-            if let Err(e) = reload_handle.modify(|f| *f = LevelFilter::from_level(current)) {
-                error!(error = %AppError::LevelReload(e), "failed to update log level");
-            } else {
-                info!(level = %current, "log level changed via SIGUSR1");
+            match apply_toggle(&reload_handle, current) {
+                Ok(new_level) => {
+                    current = new_level;
+                    info!(level = %current, "log level changed via SIGUSR1");
+                }
+                Err(e) => error!(error = %e, "failed to update log level"),
             }
         }
     });
@@ -218,8 +232,6 @@ mod tests {
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
-    #[cfg(unix)]
-    use libc;
     use tower::ServiceExt; // for `.oneshot()`
 
     fn test_app() -> Router {
@@ -351,61 +363,49 @@ mod tests {
         assert_eq!(l, Level::DEBUG, "two toggles should return to DEBUG");
     }
 
-    #[tokio::test]
-    async fn reload_handle_updates_level_filter() {
-        // `_layer` must stay alive: the handle holds a Weak reference to it.
+    // `_layer` must stay alive in each test: the handle holds a Weak reference to it.
+
+    #[test]
+    fn apply_toggle_debug_to_info() {
         let (_layer, handle) =
             reload::Layer::<LevelFilter, tracing_subscriber::Registry>::new(LevelFilter::DEBUG);
 
-        handle
-            .modify(|f| *f = LevelFilter::INFO)
-            .expect("modify should succeed");
+        let new_level = apply_toggle(&handle, Level::DEBUG).expect("apply_toggle should succeed");
 
+        assert_eq!(new_level, Level::INFO);
         handle
             .with_current(|f| assert_eq!(*f, LevelFilter::INFO))
-            .expect("with_current should succeed");
+            .expect("filter should be INFO");
     }
 
-    /// End-to-end: send SIGUSR1 to the current process and verify the reload
-    /// handle reflects the toggled level.
-    #[tokio::test]
-    async fn sigusr1_toggles_reload_handle_level() {
-        // `_layer` must stay alive: the handle holds a Weak reference to it.
+    #[test]
+    fn apply_toggle_info_to_debug() {
+        let (_layer, handle) =
+            reload::Layer::<LevelFilter, tracing_subscriber::Registry>::new(LevelFilter::INFO);
+
+        let new_level = apply_toggle(&handle, Level::INFO).expect("apply_toggle should succeed");
+
+        assert_eq!(new_level, Level::DEBUG);
+        handle
+            .with_current(|f| assert_eq!(*f, LevelFilter::DEBUG))
+            .expect("filter should be DEBUG");
+    }
+
+    #[test]
+    fn apply_toggle_cycles_back_to_debug() {
         let (_layer, handle) =
             reload::Layer::<LevelFilter, tracing_subscriber::Registry>::new(LevelFilter::DEBUG);
-        let handle_task = handle.clone();
 
-        // Shared level so the test can inspect what the task recorded.
-        let level_seen: Arc<Mutex<Option<Level>>> = Arc::new(Mutex::new(None));
-        let level_seen_task = Arc::clone(&level_seen);
+        let after_first =
+            apply_toggle(&handle, Level::DEBUG).expect("first apply_toggle should succeed");
+        assert_eq!(after_first, Level::INFO);
 
-        let mut sig =
-            signal(SignalKind::user_defined1()).expect("failed to register SIGUSR1 in test");
-
-        tokio::spawn(async move {
-            sig.recv().await;
-            let new_level = toggle_level(Level::DEBUG);
-            *level_seen_task.lock().unwrap() = Some(new_level);
-            handle_task
-                .modify(|f| *f = LevelFilter::from_level(new_level))
-                .unwrap();
-        });
-
-        // Send SIGUSR1 to ourselves.
-        unsafe { libc::raise(libc::SIGUSR1) };
-
-        // Give the spawned task a moment to process the signal.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // The task should have toggled DEBUG → INFO.
-        assert_eq!(
-            *level_seen.lock().unwrap(),
-            Some(Level::INFO),
-            "task should have recorded INFO after first SIGUSR1"
-        );
+        let after_second =
+            apply_toggle(&handle, after_first).expect("second apply_toggle should succeed");
+        assert_eq!(after_second, Level::DEBUG);
 
         handle
-            .with_current(|f| assert_eq!(*f, LevelFilter::INFO))
-            .expect("reload handle should reflect INFO");
+            .with_current(|f| assert_eq!(*f, LevelFilter::DEBUG))
+            .expect("filter should be back to DEBUG after two toggles");
     }
 }
